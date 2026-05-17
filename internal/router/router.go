@@ -22,6 +22,7 @@ func Setup(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	venueRepo := repository.NewVenueRepository(db)
 	showtimeRepo := repository.NewShowtimeRepository(db)
 	seatHoldRepo := repository.NewSeatHoldRepository(db)
+	reservationRepo := repository.NewReservationRepository(db)
 
 	// Services
 	authService := service.NewAuthService(userRepo, cfg.JWTSecret)
@@ -29,6 +30,8 @@ func Setup(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	venueService := service.NewVenueService(venueRepo)
 	showtimeService := service.NewShowtimeService(showtimeRepo, movieRepo, venueRepo)
 	seatHoldService := service.NewSeatHoldService(seatHoldRepo, showtimeRepo, venueRepo)
+	reservationService := service.NewReservationService(reservationRepo)
+	adminService := service.NewAdminService(reservationRepo, userRepo)
 
 	// Handlers
 	authHandler := handler.NewAuthHandler(authService)
@@ -36,6 +39,8 @@ func Setup(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	venueHandler := handler.NewVenueHandler(venueService)
 	showtimeHandler := handler.NewShowtimeHandler(showtimeService)
 	seatHoldHandler := handler.NewSeatHoldHandler(seatHoldService)
+	reservationHandler := handler.NewReservationHandler(reservationService)
+	adminHandler := handler.NewAdminHandler(adminService)
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -65,6 +70,10 @@ func Setup(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	{
 		user.POST("/showtimes/:id/holds", seatHoldHandler.HoldSeats)
 		user.DELETE("/holds/:id", seatHoldHandler.ReleaseHold)
+
+		user.GET("/reservations", reservationHandler.List)
+		user.POST("/reservations", reservationHandler.Create)
+		user.DELETE("/reservations/:id", reservationHandler.Cancel)
 	}
 
 	// Admin-only routes
@@ -83,6 +92,10 @@ func Setup(db *gorm.DB, cfg *config.Config) *gin.Engine {
 		admin.GET("/venues/:id/seats", venueHandler.ListSeats)
 		admin.POST("/venues/:id/seats", venueHandler.AddSeat)
 		admin.DELETE("/venues/:id/seats/:seat_id", venueHandler.RemoveSeat)
+
+		admin.GET("/reservations", adminHandler.ListReservations)
+		admin.GET("/reports", adminHandler.GetReport)
+		admin.PUT("/users/:id/promote", adminHandler.PromoteUser)
 	}
 
 	return r

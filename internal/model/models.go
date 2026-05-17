@@ -82,12 +82,23 @@ type Reservation struct {
 	UpdatedAt  time.Time         `                   json:"updated_at"`
 	DeletedAt  gorm.DeletedAt    `gorm:"index"       json:"-"`
 	UserID     uint              `gorm:"not null;index"                               json:"user_id"`
-	User       User              `                                                    json:"user,omitempty"`
+	User       *User             `                                                    json:"user,omitempty"`
 	ShowtimeID uint              `gorm:"not null;index"                               json:"showtime_id"`
 	Showtime   Showtime          `                                                    json:"showtime,omitempty"`
 	Status     ReservationStatus `gorm:"type:varchar(50);not null;default:'confirmed'" json:"status"`
 	TotalPrice float64           `gorm:"not null"                                     json:"total_price"`
 	Seats      []Seat            `gorm:"many2many:reservation_seats;"                 json:"seats,omitempty"`
+}
+
+type ShowtimeReport struct {
+	ShowtimeID     uint      `json:"showtime_id"`
+	Movie          string    `json:"movie"`
+	Venue          string    `json:"venue"`
+	StartTime      time.Time `json:"start_time"`
+	TotalSeats     int       `json:"total_seats"`
+	SeatsSold      int       `json:"seats_sold"`
+	SeatsAvailable int       `json:"seats_available"`
+	Revenue        float64   `json:"revenue"`
 }
 
 type SeatHold struct {

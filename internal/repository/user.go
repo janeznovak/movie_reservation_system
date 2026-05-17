@@ -29,3 +29,14 @@ func (r *UserRepository) FindByEmail(email string) (*model.User, error) {
 func (r *UserRepository) Create(user *model.User) error {
 	return r.db.Create(user).Error
 }
+
+func (r *UserRepository) SetRole(id uint, role model.Role) error {
+	result := r.db.Model(&model.User{}).Where("id = ?", id).Update("role", role)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return apperr.ErrNotFound
+	}
+	return nil
+}

@@ -635,3 +635,176 @@ Showtime *Showtime `json:"showtime,omitempty"`
 ```
 
 The `SeatHold` model uses `*Showtime` because the hold response doesn't preload the showtime (the client already knows which showtime they booked). Using a pointer means the field disappears from the JSON entirely when not populated.
+
+---
+
+## Phase 7 — Reservations
+
+Implemented the full booking flow: converting holds into a confirmed reservation, listing a user's reservations, and cancellation.
+
+### What was built
+
+| File | Purpose |
+|------|---------|
+| `internal/repository/reservation.go` | Transactional hold-to-reservation conversion, find by user, cancel |
+| `internal/service/reservation.go` | Validates ownership, cancellation eligibility, deduplicates hold IDs |
+| `internal/handler/reservation.go` | HTTP handlers for the three endpoints |
+
+### Endpoints
+
+```
+POST   /api/reservations      → confirm holds into a reservation (user, requires JWT)
+GET    /api/reservations      → list my reservations (user, requires JWT)
+DELETE /api/reservations/:id  → cancel an upcoming reservation (user, requires JWT)
+```
+
+### Concepts
+
+#### Converting holds into a reservation
+
+The request body is just the hold IDs the user wants to confirm:
+
+```json
+{ "hold_ids": [3, 4] }
+```
+
+Inside a transaction, the repository:
+1. Locks the hold rows with `SELECT FOR UPDATE`
+2. Validates all holds belong to the user and the same showtime
+3. Validates none have expired (`expires_at > now()`)
+4. Gets the showtime price, calculates `total_price = price × count`
+5. Creates the reservation row
+6. Inserts the seats into the `reservation_seats` join table via GORM's `Association("Seats").Append`
+7. Soft-deletes the holds — they are no longer needed
+
+If a hold expired between the user browsing and paying, the server returns 409 with the message "your hold timed out, please select seats again".
+
+#### Why total_price is stored at booking time
+
+The showtime price is copied into `total_price` on the reservation at the moment of booking:
+
+```go
+TotalPrice: showtime.Price * float64(len(holds)),
+```
+
+If an admin later changes the showtime price, existing reservations keep the price the user actually paid. Historical accuracy is preserved because the number is stored, not computed on the fly.
+
+#### Cancellation rules
+
+Two checks happen before cancelling:
+
+1. **Ownership** — `reservation.UserID != userID` → 404 (same pattern as holds: don't reveal other users' data)
+2. **Time** — `showtime.StartTime` must be in the future; you cannot cancel after the film has started
+
+After cancellation the status changes to `cancelled`. The seats in `reservation_seats` are kept — they're historical record. The availability query already handles this by only excluding seats linked to `status = 'confirmed'` reservations, so cancelled reservation seats automatically become bookable again.
+
+#### Nested preloads
+
+The reservation response includes the full showtime (with movie and venue nested inside). GORM's preload accepts a callback function to chain further preloads on the relation:
+
+```go
+db.Preload("Showtime", func(db *gorm.DB) *gorm.DB {
+    return db.Preload("Movie").Preload("Venue")
+}).Preload("Seats").First(&reservation, id)
+```
+
+This runs three extra SELECT queries behind the scenes (showtime, movie, venue) and assembles them into the struct automatically.
+
+#### New sentinel error: ErrExpired
+
+The `apperr` package now has three sentinel errors:
+
+```go
+var (
+    ErrNotFound = errors.New("not found")   // resource doesn't exist
+    ErrConflict = errors.New("already exists")  // duplicate / seat taken
+    ErrExpired  = errors.New("expired")     // hold timed out before confirmation
+)
+```
+
+Each maps to a specific HTTP status code in the handler: 404, 409, and 409 respectively. Using named sentinel errors (rather than plain string messages) means the handler can check with `errors.Is` instead of comparing strings — which is more robust and doesn't break if the message wording changes.
+
+---
+
+## Phase 8 — Admin Features
+
+Implemented the three remaining admin endpoints: viewing all reservations, a per-showtime report, and promoting a user to admin.
+
+### What was built
+
+| File | Purpose |
+|------|---------|
+| `internal/model/models.go` | Added `ShowtimeReport` result struct |
+| `internal/repository/user.go` | Added `SetRole` — updates role, detects not-found via `RowsAffected` |
+| `internal/repository/reservation.go` | Added `FindAll` (with user preloaded) and `GetReport` (raw SQL) |
+| `internal/service/admin.go` | `AdminService` — thin layer wiring the three operations |
+| `internal/handler/admin.go` | `AdminHandler` — three HTTP handlers |
+
+### Endpoints
+
+```
+GET /api/admin/reservations    → all reservations with user, showtime, seats (admin)
+GET /api/admin/reports         → capacity and revenue per showtime (admin)
+PUT /api/admin/users/:id/promote → promote a user to admin (admin)
+```
+
+### Concepts
+
+#### The report query
+
+The report uses raw SQL because it aggregates across multiple tables in a way that doesn't map cleanly to GORM's query builder. Each row in the result is one showtime:
+
+```sql
+SELECT
+    st.id AS showtime_id,
+    m.title AS movie,
+    v.name AS venue,
+    st.start_time,
+    (SELECT COUNT(*) FROM seats WHERE venue_id = st.venue_id ...)      AS total_seats,
+    (SELECT COUNT(DISTINCT rs.seat_id) FROM reservation_seats rs
+     JOIN reservations r ... WHERE r.showtime_id = st.id ...)          AS seats_sold,
+    total_seats - seats_sold                                            AS seats_available,
+    (SELECT COALESCE(SUM(total_price), 0) FROM reservations r ...)     AS revenue
+FROM showtimes st
+JOIN movies m ... JOIN venues v ...
+```
+
+`COALESCE(SUM(...), 0)` handles showtimes with no reservations — `SUM` of zero rows returns `NULL`, and `COALESCE` converts it to `0`.
+
+GORM's `db.Raw(...).Scan(&results)` runs the raw SQL and maps column names to struct fields automatically (it matches `seats_sold` → `SeatsSold`, `start_time` → `StartTime`, etc.).
+
+#### Detecting not-found without a prior lookup
+
+For `PromoteUser`, rather than fetching the user first just to check it exists, the repository does the update and checks how many rows were affected:
+
+```go
+result := r.db.Model(&model.User{}).Where("id = ?", id).Update("role", role)
+if result.RowsAffected == 0 {
+    return apperr.ErrNotFound
+}
+```
+
+If the user doesn't exist, the UPDATE touches 0 rows. One round trip to the database instead of two. This pattern applies whenever the update itself is the only thing you need — you don't need to read the record first.
+
+#### Why the old JWT still shows the old role after promotion
+
+JWT tokens are signed and self-contained — the server doesn't store them. Once issued, a token can't be changed. Promoting a user updates the database, but existing tokens are unaffected until they expire or the user logs in again and gets a fresh token.
+
+This is a known trade-off of stateless JWT auth. Alternatives (like keeping a token blacklist or using short expiry times) add complexity. For this project, the 24-hour expiry and the expectation that the user logs in after promotion is acceptable.
+
+---
+
+## Project Complete
+
+All 26 endpoints implemented across 8 phases:
+
+| Phase | What | Endpoints |
+|-------|------|-----------|
+| 1 | Scaffold | `/health` |
+| 2 | Auth | register, login |
+| 3 | Movies | CRUD + list |
+| 4 | Venues & Seats | venue CRUD, seat add/remove |
+| 5 | Showtimes | CRUD + browse by date/movie |
+| 6 | Seat Holds | availability, hold, release |
+| 7 | Reservations | confirm, list mine, cancel |
+| 8 | Admin | all reservations, reports, promote |
